@@ -1,0 +1,21 @@
+{
+  "name": "synapse-md",
+  "version": "0.1.0",
+  "description": "Shared memory for AI agent teams",
+  "type": "module",
+  "bin": {
+    "synapse-md": "./bin/synapse-md.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts"
+  },
+  "keywords": ["ai", "agents", "memory", "synapse", "shared-memory"],
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "tsx": "^4.19.0",
+    "@types/node": "^22.0.0"
+  }
+}
