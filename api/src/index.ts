@@ -247,6 +247,34 @@ async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_webhooks_status ON webhooks(workspace_id, status);
     `;
 
+    // Migration: add fingerprint columns to agent_keys
+    const addAgentKeyFingerprint = `ALTER TABLE agent_keys ADD COLUMN IF NOT EXISTS fingerprint TEXT`;
+    const addAgentKeyFingerprintBoundAt = `ALTER TABLE agent_keys ADD COLUMN IF NOT EXISTS fingerprint_bound_at TIMESTAMPTZ`;
+    const addAgentKeyLastIp = `ALTER TABLE agent_keys ADD COLUMN IF NOT EXISTS last_ip TEXT`;
+    const addAgentKeyExpiresAt = `ALTER TABLE agent_keys ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ`;
+
+    // Migration: add fingerprint columns to agents_v2
+    const addAgentV2Fingerprint = `ALTER TABLE agents_v2 ADD COLUMN IF NOT EXISTS fingerprint TEXT`;
+    const addAgentV2FingerprintBoundAt = `ALTER TABLE agents_v2 ADD COLUMN IF NOT EXISTS fingerprint_bound_at TIMESTAMPTZ`;
+    const addAgentV2LastIp = `ALTER TABLE agents_v2 ADD COLUMN IF NOT EXISTS last_ip TEXT`;
+
+    // Key audit log table
+    const createKeyAuditLog = `
+      CREATE TABLE IF NOT EXISTS key_audit_log (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        event TEXT NOT NULL,
+        ip TEXT,
+        fingerprint TEXT,
+        details TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `;
+    const createKeyAuditLogIndex = `
+      CREATE INDEX IF NOT EXISTS idx_key_audit_workspace ON key_audit_log(workspace_id, created_at DESC)
+    `;
+
     await client.query(createWorkspaces);
     await client.query(createEntries);
     await client.query(createAgents);
@@ -263,6 +291,17 @@ async function initDatabase() {
     await client.query(createInvitationsIndices);
     await client.query(createWebhooks);
     await client.query(createWebhooksIndex);
+
+    // Fingerprint & audit migrations
+    await client.query(addAgentKeyFingerprint).catch(() => {});
+    await client.query(addAgentKeyFingerprintBoundAt).catch(() => {});
+    await client.query(addAgentKeyLastIp).catch(() => {});
+    await client.query(addAgentKeyExpiresAt).catch(() => {});
+    await client.query(addAgentV2Fingerprint).catch(() => {});
+    await client.query(addAgentV2FingerprintBoundAt).catch(() => {});
+    await client.query(addAgentV2LastIp).catch(() => {});
+    await client.query(createKeyAuditLog);
+    await client.query(createKeyAuditLogIndex).catch(() => {});
     
     console.log('Database tables initialized successfully');
   } catch (error) {
@@ -1328,6 +1367,106 @@ app.use('*', async (c, next) => {
   await next();
 });
 
+// ─── FINGERPRINT & KEY AUDIT HELPERS ─────────────────────────────────────────
+
+async function logKeyAudit(
+  workspaceId: string,
+  agentId: string,
+  event: string,
+  ip: string,
+  fingerprint: string | null,
+  details: string | null
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    const id = 'kaud_' + crypto.randomBytes(8).toString('hex');
+    await client.query(
+      'INSERT INTO key_audit_log (id, workspace_id, agent_id, event, ip, fingerprint, details) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [id, workspaceId, agentId, event, ip, fingerprint, details]
+    );
+  } catch (err) {
+    console.warn('[synapse] Failed to write key audit log:', err);
+  } finally {
+    client.release();
+  }
+}
+
+async function bindFingerprintToAgentKey(keyHash: string, fingerprint: string): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query(
+      'UPDATE agent_keys SET fingerprint = $1, fingerprint_bound_at = NOW() WHERE key_hash = $2',
+      [fingerprint, keyHash]
+    );
+  } finally {
+    client.release();
+  }
+}
+
+async function updateAgentKeyLastIp(keyHash: string, ip: string): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query('UPDATE agent_keys SET last_ip = $1 WHERE key_hash = $2', [ip, keyHash]);
+  } finally {
+    client.release();
+  }
+}
+
+async function bindFingerprintToAgentV2(workspaceId: string, agentId: string, fingerprint: string): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query(
+      'UPDATE agents_v2 SET fingerprint = $1, fingerprint_bound_at = NOW() WHERE workspace_id = $2 AND agent_id = $3',
+      [fingerprint, workspaceId, agentId]
+    );
+  } finally {
+    client.release();
+  }
+}
+
+async function updateAgentV2LastIp(workspaceId: string, agentId: string, ip: string): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query(
+      'UPDATE agents_v2 SET last_ip = $1 WHERE workspace_id = $2 AND agent_id = $3',
+      [ip, workspaceId, agentId]
+    );
+  } finally {
+    client.release();
+  }
+}
+
+async function getKeyAuditLog(
+  workspaceId: string,
+  agentId: string | null,
+  event: string | null,
+  limit: number
+): Promise<any[]> {
+  const client = await pool.connect();
+  try {
+    let query = 'SELECT * FROM key_audit_log WHERE workspace_id = $1';
+    const params: any[] = [workspaceId];
+    let paramIdx = 2;
+
+    if (agentId) {
+      query += ` AND agent_id = $${paramIdx++}`;
+      params.push(agentId);
+    }
+    if (event) {
+      query += ` AND event = $${paramIdx++}`;
+      params.push(event);
+    }
+
+    query += ` ORDER BY created_at DESC LIMIT $${paramIdx}`;
+    params.push(limit);
+
+    const result = await client.query(query, params);
+    return result.rows;
+  } finally {
+    client.release();
+  }
+}
+
 // Auth middleware supporting both Authorization and X-Agent-Key headers
 async function authMiddleware(c: Context<AppEnvironment>, next: () => Promise<void>): Promise<Response | void> {
   try {
@@ -1357,6 +1496,9 @@ async function authMiddleware(c: Context<AppEnvironment>, next: () => Promise<vo
     
     if (token.startsWith('syn_a_')) {
       // Agent key - try new agent system first, fallback to legacy
+      let isLegacyKeyAuth = false;
+      let legacyKeyRow: any = null;
+
       try {
         agent = await getAgentByKey(token);
         console.log('Agent lookup result for token prefix', token.substring(0, 12), ':', agent ? `found ${agent.agentId}` : 'not found');
@@ -1377,9 +1519,19 @@ async function authMiddleware(c: Context<AppEnvironment>, next: () => Promise<vo
         if (!agentKeyRow) {
           return c.json({ error: 'Invalid or revoked agent key', code: 'AUTH_INVALID' }, 401);
         }
+
+        // Check key expiry
+        if (agentKeyRow.expires_at && new Date(agentKeyRow.expires_at) < new Date()) {
+          const expIp = c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || 'unknown';
+          await logKeyAudit(agentKeyRow.workspace_id, agentKeyRow.agent_id, 'verify_fail', expIp, null, 'expired');
+          return c.json({ error: 'Key expired', code: 'AUTH_EXPIRED' }, 401);
+        }
         
         // Update last_used timestamp
         await updateKeyLastUsed(keyHash);
+
+        isLegacyKeyAuth = true;
+        legacyKeyRow = agentKeyRow;
         
         workspace = await getWorkspaceById(agentKeyRow.workspace_id) || undefined;
         isWriteKey = agentKeyRow.permissions === 'write' || agentKeyRow.permissions === 'admin';
@@ -1402,6 +1554,80 @@ async function authMiddleware(c: Context<AppEnvironment>, next: () => Promise<vo
           updatedAt: agentKeyRow.created_at
         };
       }
+
+      // ── Fingerprint verification (all syn_a_ tokens) ──────────────────────
+      if (agent && workspace) {
+        const fpHeader = c.req.header('X-Agent-Fingerprint') || null;
+        const clientIp = c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || 'unknown';
+
+        if (isLegacyKeyAuth && legacyKeyRow) {
+          const storedFp = (legacyKeyRow.fingerprint as string | null) || null;
+          const keyHash = hashApiKey(token);
+
+          if (!storedFp) {
+            if (fpHeader) {
+              // First use: bind fingerprint (cap at 128 chars)
+              const fpToStore = fpHeader.substring(0, 128);
+              await bindFingerprintToAgentKey(keyHash, fpToStore);
+              await logKeyAudit(workspace.id, agent.agentId, 'bind', clientIp, fpToStore, null);
+            } else {
+              // Legacy mode: no fingerprint set, no header supplied — proceed with warning
+              console.warn(`[synapse] Agent key for '${agent.agentId}' has no fingerprint bound (legacy mode)`);
+            }
+          } else {
+            if (!fpHeader) {
+              await logKeyAudit(workspace.id, agent.agentId, 'verify_fail', clientIp, null, 'fingerprint_required');
+              return c.json({ error: 'Fingerprint required for bound keys', code: 'FINGERPRINT_REQUIRED' }, 403);
+            } else if (fpHeader !== storedFp) {
+              await logKeyAudit(workspace.id, agent.agentId, 'verify_fail', clientIp, fpHeader.substring(0, 128), 'mismatch');
+              return c.json({ error: 'Fingerprint mismatch', code: 'FINGERPRINT_MISMATCH' }, 403);
+            } else {
+              // Fingerprint OK — update last_ip and log
+              await updateAgentKeyLastIp(keyHash, clientIp);
+              await logKeyAudit(workspace.id, agent.agentId, 'verify_ok', clientIp, fpHeader.substring(0, 128), null);
+            }
+          }
+        } else {
+          // agents_v2 path: fetch stored fingerprint from DB
+          const fpClient = await pool.connect();
+          let agentV2FpRow: any;
+          try {
+            const fpResult = await fpClient.query(
+              'SELECT fingerprint FROM agents_v2 WHERE workspace_id = $1 AND agent_id = $2',
+              [workspace.id, agent.agentId]
+            );
+            agentV2FpRow = fpResult.rows[0];
+          } finally {
+            fpClient.release();
+          }
+
+          if (agentV2FpRow) {
+            const storedFp = (agentV2FpRow.fingerprint as string | null) || null;
+
+            if (!storedFp) {
+              if (fpHeader) {
+                const fpToStore = fpHeader.substring(0, 128);
+                await bindFingerprintToAgentV2(workspace.id, agent.agentId, fpToStore);
+                await logKeyAudit(workspace.id, agent.agentId, 'bind', clientIp, fpToStore, null);
+              } else {
+                console.warn(`[synapse] agents_v2 agent '${agent.agentId}' has no fingerprint bound (legacy mode)`);
+              }
+            } else {
+              if (!fpHeader) {
+                await logKeyAudit(workspace.id, agent.agentId, 'verify_fail', clientIp, null, 'fingerprint_required');
+                return c.json({ error: 'Fingerprint required for bound keys', code: 'FINGERPRINT_REQUIRED' }, 403);
+              } else if (fpHeader !== storedFp) {
+                await logKeyAudit(workspace.id, agent.agentId, 'verify_fail', clientIp, fpHeader.substring(0, 128), 'mismatch');
+                return c.json({ error: 'Fingerprint mismatch', code: 'FINGERPRINT_MISMATCH' }, 403);
+              } else {
+                await updateAgentV2LastIp(workspace.id, agent.agentId, clientIp);
+                await logKeyAudit(workspace.id, agent.agentId, 'verify_ok', clientIp, fpHeader.substring(0, 128), null);
+              }
+            }
+          }
+        }
+      }
+      // ─────────────────────────────────────────────────────────────────────
     } else {
       // Legacy workspace keys
       workspace = await getWorkspaceByKey(token) || undefined;
@@ -3403,6 +3629,138 @@ app.post('/api/v1/workspaces/:id/bridge-policy', authMiddleware, async (c) => {
     });
   } catch (error) {
     console.error('Error setting bridge policy:', error);
+    return c.json({ error: 'Internal server error', code: 'INTERNAL_ERROR' }, 500);
+  }
+});
+
+// ─── KEY ROTATION ENDPOINT ───────────────────────────────────────────────────
+
+// POST /api/v1/workspaces/:id/agents/:agentId/rotate-key
+// Requires workspace write key auth (owner/admin). Generates new syn_a_ key,
+// revokes old key, clears fingerprint (fresh binding), and logs 'rotate' event.
+app.post('/api/v1/workspaces/:id/agents/:agentId/rotate-key', authMiddleware, async (c) => {
+  try {
+    const workspace = c.get('workspace') as Workspace;
+    const workspaceId = c.req.param('id');
+    const agentId = c.req.param('agentId');
+    const apiKey = c.get('apiKey') as string;
+    const isWriteKey = c.get('isWriteKey') as boolean;
+
+    if (workspace.id !== workspaceId) {
+      return c.json({ error: 'Workspace mismatch', code: 'WORKSPACE_MISMATCH' }, 400);
+    }
+
+    // Only write keys (workspace-level syn_w_ or admin agent) can rotate
+    if (!isWriteKey) {
+      return c.json({ error: 'Write access required to rotate keys', code: 'INSUFFICIENT_PERMISSIONS' }, 403);
+    }
+
+    const clientIp = c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || 'unknown';
+
+    const dbClient = await pool.connect();
+    try {
+      // Look up the agent in agents_v2 first
+      const agentResult = await dbClient.query(
+        'SELECT * FROM agents_v2 WHERE workspace_id = $1 AND agent_id = $2 AND status = $3',
+        [workspaceId, agentId, 'active']
+      );
+
+      if (agentResult.rows.length > 0) {
+        // agents_v2 path: generate new key, clear fingerprint
+        const newKey = generateAgentKey();
+        await dbClient.query(
+          'UPDATE agents_v2 SET agent_key = $1, fingerprint = NULL, fingerprint_bound_at = NULL, updated_at = NOW() WHERE workspace_id = $2 AND agent_id = $3',
+          [newKey, workspaceId, agentId]
+        );
+        await logKeyAudit(workspaceId, agentId, 'rotate', clientIp, null, 'agents_v2 key rotated');
+        return c.json({
+          agentId,
+          newKey,
+          message: 'Agent key rotated. Fingerprint cleared — next use will bind a new fingerprint.'
+        });
+      }
+
+      // Legacy agent_keys path: revoke all existing keys, create new one
+      const existingKeys = await dbClient.query(
+        'SELECT * FROM agent_keys WHERE workspace_id = $1 AND agent_id = $2 AND revoked = FALSE',
+        [workspaceId, agentId]
+      );
+
+      if (existingKeys.rows.length === 0) {
+        return c.json({ error: 'Agent not found or has no active keys', code: 'NOT_FOUND' }, 404);
+      }
+
+      // Revoke all old keys
+      await dbClient.query(
+        'UPDATE agent_keys SET revoked = TRUE WHERE workspace_id = $1 AND agent_id = $2 AND revoked = FALSE',
+        [workspaceId, agentId]
+      );
+
+      // Get permissions from the first active key
+      const oldPermissions = existingKeys.rows[0].permissions || 'write';
+
+      // Create new key
+      const keyId = generateKeyId();
+      const newKey = generateAgentKey();
+      const keyHash = hashApiKey(newKey);
+      const keyPrefix = newKey.slice(0, 15) + '...';
+
+      await dbClient.query(
+        'INSERT INTO agent_keys (id, workspace_id, agent_id, key_hash, key_prefix, permissions) VALUES ($1, $2, $3, $4, $5, $6)',
+        [keyId, workspaceId, agentId, keyHash, keyPrefix, oldPermissions]
+      );
+
+      await logKeyAudit(workspaceId, agentId, 'rotate', clientIp, null, `legacy key rotated; revoked=${existingKeys.rows.length} old keys`);
+
+      return c.json({
+        agentId,
+        keyId,
+        newKey,
+        permissions: oldPermissions,
+        message: 'Agent key rotated. Fingerprint cleared — next use will bind a new fingerprint.'
+      });
+    } finally {
+      dbClient.release();
+    }
+  } catch (error) {
+    console.error('Error rotating agent key:', error);
+    return c.json({ error: 'Internal server error', code: 'INTERNAL_ERROR' }, 500);
+  }
+});
+
+// ─── KEY AUDIT LOG ENDPOINT ───────────────────────────────────────────────────
+
+// GET /api/v1/workspaces/:id/audit-log
+// Returns key fingerprint audit events (bind, verify_ok, verify_fail, rotate, revoke).
+// Requires workspace write key auth.
+// Query params: agent_id, event, limit (default 50)
+app.get('/api/v1/workspaces/:id/audit-log', authMiddleware, async (c) => {
+  try {
+    const workspace = c.get('workspace') as Workspace;
+    const workspaceId = c.req.param('id');
+    const isWriteKey = c.get('isWriteKey') as boolean;
+
+    if (workspace.id !== workspaceId) {
+      return c.json({ error: 'Workspace mismatch', code: 'WORKSPACE_MISMATCH' }, 400);
+    }
+
+    if (!isWriteKey) {
+      return c.json({ error: 'Write access required to view audit log', code: 'INSUFFICIENT_PERMISSIONS' }, 403);
+    }
+
+    const agentIdFilter = c.req.query('agent_id') || null;
+    const eventFilter = c.req.query('event') || null;
+    const limit = Math.min(parseInt(c.req.query('limit') || '50', 10), 500);
+
+    const events = await getKeyAuditLog(workspaceId, agentIdFilter, eventFilter, limit);
+
+    return c.json({
+      workspaceId,
+      total: events.length,
+      events
+    });
+  } catch (error) {
+    console.error('Error getting key audit log:', error);
     return c.json({ error: 'Internal server error', code: 'INTERNAL_ERROR' }, 500);
   }
 });

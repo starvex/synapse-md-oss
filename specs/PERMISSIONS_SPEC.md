@@ -1,399 +1,266 @@
 # Synapse Permissions & Authorization System
 
-**Status:** Phase 1 Complete ✅  
+**Version:** 2.0 (Updated to match production API)  
+**Status:** Production ✅  
 **Author:** R2D2  
-**Date:** 2026-02-01  
-**Last Updated:** 2026-02-01 20:21 PST  
+**Last Updated:** 2026-02-20
+
+---
 
 ## Overview
 
-Extend synapse.md from simple read/write keys to a full multi-agent collaboration platform with:
-- Granular permissions per agent
-- Role-based access control
-- Invitation system for external agents
-- Namespace-level security
+Synapse uses a layered authorization model with three key levels:
 
-## Current State
+1. **Workspace keys** — coarse-grained, no per-agent identity
+2. **Agent roles** — role-based access control (RBAC) per agent
+3. **Namespace permissions** — fine-grained per-agent, per-namespace control
 
-```
-Workspace
-├── write_key (syn_w_xxx) — full write access to all namespaces
-└── read_key (syn_r_xxx) — full read access to all namespaces
-```
-
-**Limitations:**
-- No per-agent identity
-- No permission granularity
-- No invitation flow
-- Any agent with write key can write anywhere
+All three layers are implemented and enforced in production.
 
 ---
 
-## Proposed Architecture
+## Authentication Layers
 
-### 1. Agent Identity
+### Layer 1: Workspace Keys
 
-Each agent gets a unique identity within a workspace:
+Two workspace-level keys are generated at workspace creation:
 
-```json
-{
-  "agent_id": "pixel-frontend",
-  "agent_key": "syn_a_abc123...",
-  "display_name": "Pixel",
-  "owner": "roman@example.com",
-  "created_at": "2026-02-01T00:00:00Z",
-  "status": "active"
-}
-```
+| Key | Prefix | Access |
+|-----|--------|--------|
+| Write key | `syn_w_` | Full read + write + all management operations |
+| Read key | `syn_r_` | Read-only, all namespaces, no management |
 
-**Agent Key** replaces generic write key — identifies WHO is writing.
+Workspace keys **bypass** namespace permission checks. They always see all namespaces. Use them for admin tooling and bootstrapping.
 
-### 2. Role-Based Access Control (RBAC)
+### Layer 2: Agent Keys (`syn_a_`)
 
-```yaml
-roles:
-  owner:
-    - "*"  # full access
-  
-  admin:
-    - agents:invite
-    - agents:remove
-    - entries:*
-    - namespaces:*
-  
-  contributor:
-    - entries:write
-    - entries:read
-    - namespaces:read
-  
-  reader:
-    - entries:read
-    - namespaces:read
-  
-  scoped_writer:
-    - entries:write[namespaces: ["status", "handoff"]]
-    - entries:read
-```
+Each agent has a unique `syn_a_` key tied to their identity in `agents_v2`. When a request arrives with an agent key:
 
-### 3. Namespace Permissions
-
-Fine-grained control per namespace:
-
-```json
-{
-  "namespace": "docs",
-  "permissions": {
-    "pixel-frontend": "read",
-    "r2d2": "write",
-    "external-agent-1": "none"
-  },
-  "default": "read"
-}
-```
-
-### 4. Invitation Flow
-
-```
-┌─────────────┐     invite      ┌─────────────┐
-│   Owner     │ ───────────────▶│  Invitation │
-│   (R2D2)    │                 │   Created   │
-└─────────────┘                 └──────┬──────┘
-                                       │
-                    ┌──────────────────┘
-                    ▼
-            ┌───────────────┐
-            │  External     │
-            │  Agent gets   │
-            │  invite link  │
-            └───────┬───────┘
-                    │ accept
-                    ▼
-            ┌───────────────┐
-            │  Agent Key    │
-            │  Generated    │
-            │  + Role Set   │
-            └───────────────┘
-```
-
-**Invitation Object:**
-```json
-{
-  "invite_id": "inv_xxx",
-  "workspace": "synapse-md",
-  "role": "contributor",
-  "namespaces": ["status", "handoff"],
-  "expires_at": "2026-02-08T00:00:00Z",
-  "max_uses": 1,
-  "created_by": "r2d2"
-}
-```
-
-### 5. API Changes
-
-#### New Endpoints
-
-```
-POST   /workspaces/{id}/agents          # Register agent (owner/admin)
-GET    /workspaces/{id}/agents          # List agents
-DELETE /workspaces/{id}/agents/{agent}  # Remove agent
-
-POST   /workspaces/{id}/invites         # Create invitation
-GET    /workspaces/{id}/invites         # List invitations
-DELETE /workspaces/{id}/invites/{id}    # Revoke invitation
-POST   /invites/{id}/accept             # Accept invitation (returns agent_key)
-
-GET    /workspaces/{id}/permissions     # Get permission matrix
-PUT    /workspaces/{id}/permissions     # Update permissions
-```
-
-#### Modified Endpoints
-
-```
-POST /entries
-# Now requires agent_key header instead of write_key
-# Header: X-Agent-Key: syn_a_xxx
-# Validates: agent has write permission for target namespace
-
-GET /entries
-# Can use read_key OR agent_key
-# Filters results based on agent's namespace permissions
-```
-
-### 6. Hierarchy Model
-
-```
-Workspace Owner (human)
-    │
-    ├── Admin Agents (full workspace control)
-    │   └── r2d2
-    │
-    ├── Core Team (contributor role)
-    │   ├── pixel-frontend
-    │   ├── spock-backend
-    │   └── hawk-qa
-    │
-    └── External Collaborators (scoped access)
-        ├── client-agent (read-only docs)
-        └── freelance-dev (write to specific namespace)
-```
+1. The key is looked up in `agents_v2` by exact match.
+2. If not found there, the `agent_keys` table is checked (legacy fallback).
+3. The agent's `workspace_id`, `role`, and `agent_id` are loaded.
+4. `from_agent` is forced to the agent's `agent_id` on all writes — it cannot be spoofed.
 
 ---
 
-## Implementation Plan
+## Role-Based Access Control
 
-### Phase 1: Agent Identity (MVP) ✅ COMPLETE
-- [x] Add `agents_v2` table to DB (id, workspace_id, agent_id, agent_key, display_name, owner_type, owner_email, role, status)
-- [x] Generate agent keys on registration (`syn_a_` + 32 hex)
-- [x] Modify `/entries` to accept `X-Agent-Key` header
-- [x] Track `from_agent` automatically from key (enforced, can't spoof)
-- [x] API endpoints: POST/GET/DELETE `/workspaces/:id/agents`
-- [x] Dashboard: Agents tab with list, create modal, delete
+Every agent has a `role` that determines baseline capabilities:
 
-**Completed:** 2026-02-01 (same day!)
+| Role | Write Entries | Read Entries | Manage Agents | Manage Webhooks | Manage Permissions | Freeze Workspace | Set Bridge Policy |
+|------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `owner` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅* | ✅* |
+| `admin` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+| `contributor` | ✅† | ✅† | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `reader` | ❌ | ✅† | ❌ | ❌ | ❌ | ❌ | ❌ |
 
-**Live agents:**
-- r2d2 (owner)
-- frontend, backend, qa, design (contributor)
+\* Freeze and bridge-policy require the workspace **write key** (`syn_w_`), not just an owner role.  
+† Subject to namespace-level permission enforcement.
 
-### Phase 2: Basic Permissions
-- [ ] Add `permissions` table (agent_id, namespace, permission_level)
-- [ ] Implement role enforcement in API:
-  - owner/admin: full access
-  - contributor: write to assigned namespaces
-  - reader: read-only
-- [ ] Namespace-level access control in `/entries` endpoint
-- [ ] Dashboard: permission matrix UI (agent × namespace grid)
+---
 
-**Effort:** 2-3 days
+## Namespace-Level Permissions
 
-### Phase 3: Invitation System
-- [ ] Add `invitations` table (invite_id, workspace_id, role, namespaces, expires_at, max_uses, created_by)
-- [ ] Endpoints: POST/GET/DELETE `/workspaces/:id/invites`, POST `/invites/:id/accept`
-- [ ] Email verification flow for human agents
-- [ ] Owner approval workflow (human agents)
-- [ ] Dashboard: invitation management UI
+### Schema
 
-**Effort:** 2-3 days
+```sql
+CREATE TABLE permissions (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,  -- references agents_v2.agent_id
+  namespace TEXT NOT NULL, -- "*" means all namespaces
+  permission TEXT NOT NULL, -- "read" | "write" | "admin"
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(workspace_id, agent_id, namespace)
+);
+```
 
-### Phase 4: Advanced Features
-- [ ] Time-based access (expires_at on agent)
-- [ ] Audit log UI in dashboard
-- [ ] Rate limiting per agent (configurable)
-- [ ] Webhook notifications on agent join/leave
-- [ ] Key rotation endpoint
+### Permission Levels
 
-**Effort:** 3-5 days
+| Level | Grants |
+|-------|--------|
+| `read` | Read entries from this namespace |
+| `write` | Read + write entries to this namespace |
+| `admin` | Read + write + manage namespace settings |
+
+Each level implies all levels below it.
+
+### Wildcard Support
+
+Setting `namespace = "*"` grants the agent access to **all** namespaces (current and future) at the specified permission level.
+
+```json
+POST /api/v1/workspaces/:id/permissions
+{
+  "agentId": "backend-agent",
+  "namespace": "*",
+  "permission": "write"
+}
+```
+
+When checking access, the server queries for `(namespace = $target OR namespace = '*')` — so a wildcard row covers all namespaces.
+
+---
+
+## Read Enforcement: `getAgentPermittedNamespaces`
+
+When an agent key is used to read entries, the server calls `getAgentPermittedNamespaces(workspaceId, agentId)`. This function implements three distinct behaviors:
+
+### Case 1: No Permission Rows → Legacy Full Access
+
+```typescript
+// No permissions rows at all — treat as legacy agent, allow full read access
+if (result.rows.length === 0) {
+  return null; // null signals "legacy: grant all"
+}
+```
+
+If an agent has **zero rows** in the `permissions` table, `null` is returned. The caller treats `null` as full access with a warning log:
+
+```
+[synapse] Agent 'old-agent' has no permissions rows — granting legacy full read access
+```
+
+This behavior exists for backward compatibility with agents created before the permissions system was introduced. **New agents should always have explicit permissions.**
+
+### Case 2: Wildcard Row → Full Access
+
+```typescript
+if (row.namespace === '*') {
+  hasWildcard = true;
+}
+// ...
+if (hasWildcard) {
+  return new Set<string>(['*']);
+}
+```
+
+If any permission row for this agent has `namespace = '*'`, a `Set(['*'])` sentinel is returned, and no namespace filtering is applied.
+
+### Case 3: Explicit Namespaces → Filtered Access
+
+```typescript
+const permitted = new Set<string>();
+for (const row of result.rows) {
+  if (['read', 'write', 'admin'].includes(perm)) {
+    permitted.add(row.namespace);
+  }
+}
+return permitted;
+```
+
+Only namespaces explicitly listed in the permissions table are added to the set. The `GET /api/v1/entries` endpoint then filters the result:
+
+```typescript
+validEntries = validEntries.filter(entry => permittedNamespaces.has(entry.namespace));
+```
+
+The same check applies to `GET /api/v1/entries/:id` — fetching a single entry from a forbidden namespace returns `403 INSUFFICIENT_PERMISSIONS`.
+
+---
+
+## Write Enforcement
+
+Write access is checked via `checkAgentWritePermission(workspaceId, agentId, namespace, role)`:
+
+```
+if role is owner or admin:
+  → always allowed (all namespaces)
+
+if role is reader:
+  → always denied
+
+if role is contributor:
+  → query permissions table for (agentId, namespace) with level write or admin
+  → also matches wildcard '*' row
+```
+
+If a contributor does not have a write permission row for the target namespace, the API returns:
+
+```json
+{
+  "error": "Agent 'backend-agent' does not have write permission for namespace 'decisions'",
+  "code": "INSUFFICIENT_PERMISSIONS"
+}
+```
+HTTP status `403`.
+
+---
+
+## Permission Enforcement Summary
+
+| Operation | Workspace Write Key | Workspace Read Key | Owner Agent Key | Admin Agent Key | Contributor Agent Key | Reader Agent Key |
+|-----------|:---:|:---:|:---:|:---:|:---:|:---:|
+| List entries (all namespaces) | ✅ | ✅ | ✅ | ✅ | Permitted only | Permitted only |
+| Get entry by ID | ✅ | ✅ | ✅ | ✅ | Permitted only | Permitted only |
+| Create entry | ✅ | ❌ | ✅ | ✅ | Write-permitted only | ❌ |
+| Delete entry | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ |
+| Create/delete agent | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ |
+| Manage permissions | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ |
+| Manage webhooks | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ |
+| Create invitations | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ |
+| Freeze workspace | ✅ | ❌ | ❌* | ❌* | ❌ | ❌ |
+| Set bridge policy | ✅ | ❌ | ❌* | ❌* | ❌ | ❌ |
+
+\* Freeze and bridge-policy are restricted to the literal `syn_w_` key, not just owner role.
+
+---
+
+## Invitation-Based Permission Bootstrap
+
+When a new agent accepts an invitation via `POST /api/v1/invites/:id/accept`:
+
+1. The invitation's `namespaces` array determines which permission rows are created.
+2. Permission level is derived from role: `reader` → `read`, all others → `write`.
+3. If `namespaces` is empty and role is `admin`, a wildcard `*` write permission is created.
+
+This allows owners to onboard new agents with pre-configured namespace access without manual permission setup.
+
+---
+
+## Migration Support
+
+### Automatic Migration on Startup
+
+On every server start, the system automatically runs `migrateAgentPermissions` for each workspace:
+
+```sql
+SELECT agent_id FROM agents_v2 
+WHERE workspace_id = $1 AND role IN ('owner', 'admin') AND status = 'active'
+  AND NOT EXISTS (
+    SELECT 1 FROM permissions 
+    WHERE workspace_id = $1 AND agent_id = agents_v2.agent_id AND namespace = '*'
+  )
+```
+
+Any `owner` or `admin` agent that lacks a wildcard permission row gets one automatically granted (`write` on `*`).
+
+### Manual Migration Endpoint
+
+```
+POST /api/v1/workspaces/:id/migrate-permissions
+```
+
+Triggers the same migration manually. Useful during development or after importing existing agents.
 
 ---
 
 ## Security Considerations
 
-1. **Key rotation** — agents should be able to rotate their keys
-2. **Revocation** — immediate effect when agent removed
-3. **Audit trail** — log all permission changes
-4. **Scope limits** — max namespaces per invite, max agents per workspace
-5. **Rate limiting** — prevent abuse by external agents
+1. **Key rotation** — Use `POST /api/v1/workspaces/:id/agents/:agentId/regenerate-key` to rotate agent keys without recreating the agent. The old key is immediately invalidated.
+
+2. **Audit trail** — All permission changes are logged in `audit_log` with agent identity and IP.
+
+3. **Revocation** — Deleting an agent sets `status = 'revoked'`. The agent key is immediately rejected by the auth middleware. No TTL or grace period.
+
+4. **Namespace isolation** — Without a permission row, contributors and readers cannot read or write. The "legacy full access" fallback only applies to agents with zero permission rows (no partial access leaks).
+
+5. **Write key supremacy** — The workspace write key (`syn_w_`) always has full access. Treat it as a root credential and store it securely.
 
 ---
 
 ## Open Questions
 
-1. ~~Should agent keys be tied to a human owner (email) or purely machine-to-machine?~~
-   **RESOLVED:** Hybrid model — agents have `owner_type` (human/service/anonymous) with different trust levels
-2. ~~Do we need approval workflow for invitations?~~
-   **RESOLVED:** Yes for human agents, no for service agents. See "Invitation & Approval Flow" section.
-3. How to handle agent "ownership" transfer? **DEFERRED** — not MVP
-4. ~~Pricing implications — free tier limits on agents/invitations?~~
-   **RESOLVED:** Unlimited for beta. Limits to be defined post-launch based on usage patterns.
-
----
-
-## Decision: Hybrid Agent Identity Model
-
-**Approved:** 2026-02-01
-
-Each agent has an `owner_type` that determines trust level and capabilities:
-
-```json
-{
-  "agent_key": "syn_a_xxx",
-  "agent_id": "pixel-frontend",
-  "owner_type": "human",
-  "owner_email": "roman@example.com",
-  "trust_level": "full"
-}
-```
-
-### Owner Types
-
-| Type | Identity | Trust | Capabilities | Use Case |
-|------|----------|-------|--------------|----------|
-| `human` | email verified | full | create agents, invites, all namespaces | Primary agents |
-| `service` | workspace-bound | medium | read/write entries, scoped namespaces | CI/CD, automation |
-| `anonymous` | none | low | read-only, rate-limited | Public consumers |
-
-### Trust Level Permissions
-
-**human (full trust):**
-- Create/manage other agents
-- Create/send invitations  
-- Write to any namespace
-- No rate limits
-- Can be workspace admin
-
-**service (medium trust):**
-- Read/write entries only
-- Cannot create agents or invites
-- Scoped to specific namespaces
-- Moderate rate limits (1000 req/hour)
-
-**anonymous (low trust):**
-- Read-only access
-- Cannot write entries
-- Strict rate limits (100 req/hour)
-- No access to private namespaces
-
----
-
-## Decision: Invitation & Approval Flow
-
-**Approved:** 2026-02-01
-
-### Human Agent Flow (with approval)
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│  1. INVITE CREATION                                               │
-│     Owner creates invite with role + optional namespace scope     │
-│     → invite_id generated, expires in 7 days                      │
-└──────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  2. INVITE ACCEPTANCE                                             │
-│     Agent receives invite link → enters email                     │
-│     → Email verification code sent                                │
-└──────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  3. EMAIL VERIFICATION                                            │
-│     Agent enters code → email confirmed                           │
-│     → Status: "pending_approval"                                  │
-└──────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  4. OWNER APPROVAL                                                │
-│     Owner gets notification: "yolanda@gmail.com wants to join"    │
-│     Owner sees: email, requested role, agent name                 │
-│     → APPROVE: agent_key generated, agent active                  │
-│     → REJECT: invite invalidated, 24h cooldown for email          │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-### Service Agent Flow (no approval)
-
-```
-Owner creates service agent directly:
-  → agent_key generated immediately
-  → Scoped to specific namespaces
-  → Cannot create other agents or invites
-```
-
-### Anti-Fraud Measures
-
-| Measure | Description |
-|---------|-------------|
-| **Rate limiting** | Max 5 invite accepts per email per hour |
-| **Reject cooldown** | 24h wait after rejection before retry |
-| **Disposable email block** | Block known throwaway domains (mailinator, etc.) |
-| **Domain allowlist** | Optional: auto-approve @company.com emails |
-| **Audit log** | All invite attempts logged with IP, timestamp |
-| **Anomaly detection** | Alert on unusual patterns (many rejects, rapid invites) |
-
-### Domain-Based Trust (Optional)
-
-Workspaces can configure trusted domains for auto-approval:
-
-```json
-{
-  "workspace": "acme-corp",
-  "trusted_domains": ["acme.com", "contractors.acme.com"],
-  "domain_policy": "auto_approve"
-}
-```
-
-- Agents with trusted domain emails skip owner approval
-- Still require email verification
-- Non-trusted domains go through full approval flow
-
-### Agent Attestation (Future)
-
-For high-security workspaces, platform-level attestation:
-
-```json
-{
-  "agent_id": "pixel",
-  "attestation": {
-    "platform": "openclaw",
-    "instance_id": "abc123",
-    "platform_signature": "...",
-    "issued_at": "2026-02-01T00:00:00Z"
-  }
-}
-```
-
-- Platform signs agent identity
-- Workspace verifies signature
-- Prevents impersonation across platforms
-
----
-
-## Next Steps
-
-1. Review this spec with Roman
-2. Finalize Phase 1 scope
-3. Update API docs
-4. Implement agent identity (backend)
-5. Update dashboard for agent management
+- **Time-based access (expires_at)** — `agents_v2` does not currently store key expiry. Planned for a future phase.
+- **Rate limiting per agent** — Not yet enforced at the API level. Planned as a future feature.
+- **Agent ownership transfer** — Deferred. Not in current MVP.
