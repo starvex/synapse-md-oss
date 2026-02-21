@@ -799,6 +799,47 @@ async function hasPermissionForNamespace(workspaceId: string, agentId: string, n
   }
 }
 
+// Returns a Set of permitted namespaces for an agent, or null if agent has no permissions rows (legacy — allow all).
+// '*' wildcard in the permissions table means all namespaces are permitted.
+async function getAgentPermittedNamespaces(workspaceId: string, agentId: string): Promise<Set<string> | null> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `SELECT namespace, permission FROM permissions WHERE workspace_id = $1 AND agent_id = $2`,
+      [workspaceId, agentId]
+    );
+
+    // No permissions rows at all — treat as legacy agent, allow full read access
+    if (result.rows.length === 0) {
+      return null;
+    }
+
+    const permitted = new Set<string>();
+    let hasWildcard = false;
+
+    for (const row of result.rows) {
+      const perm: string = row.permission;
+      // read, write, or admin all grant read access
+      if (['read', 'write', 'admin'].includes(perm)) {
+        if (row.namespace === '*') {
+          hasWildcard = true;
+        } else {
+          permitted.add(row.namespace);
+        }
+      }
+    }
+
+    // Wildcard means all namespaces — signal with a special sentinel Set containing '*'
+    if (hasWildcard) {
+      return new Set<string>(['*']);
+    }
+
+    return permitted;
+  } finally {
+    client.release();
+  }
+}
+
 function getRoleDefaultPermissions(role: string): { canRead: boolean; canWrite: boolean; hasAllNamespaces: boolean } {
   switch (role) {
     case 'owner':
@@ -1552,20 +1593,91 @@ app.get('/api/v1/entries', authMiddleware, async (c) => {
     }
     
     // Filter out expired entries and parse JSON fields
-    const validEntries = entries
+    let validEntries = entries
       .filter(entry => !isExpired(entry.created_at, entry.ttl))
       .map(entry => ({
         ...entry,
         tags: typeof entry.tags === 'string' ? JSON.parse(entry.tags) : entry.tags
       }))
       .filter(entry => !tag || (Array.isArray(entry.tags) && entry.tags.includes(tag)));
-    
+
+    // Namespace-level read permission enforcement for agent keys
+    const agent = (c as any).agent;
+    if (agent && agent.agentId) {
+      const permittedNamespaces = await getAgentPermittedNamespaces(workspace.id, agent.agentId);
+      if (permittedNamespaces === null) {
+        // Legacy agent with no permissions rows — allow full read, log warning
+        console.warn(`[synapse] Agent '${agent.agentId}' has no permissions rows in workspace '${workspace.id}' — granting legacy full read access`);
+      } else if (!permittedNamespaces.has('*')) {
+        // Filter to only namespaces this agent is permitted to read
+        validEntries = validEntries.filter(entry => permittedNamespaces.has(entry.namespace));
+      }
+      // else: wildcard '*' — agent may read all namespaces, no filtering needed
+    }
+    // Workspace-level keys (no agent) have admin access — return all entries unfiltered
+
     return c.json({
       entries: validEntries,
       total: validEntries.length
     });
   } catch (error) {
     console.error('Error getting entries:', error);
+    return c.json({ error: 'Internal server error', code: 'INTERNAL_ERROR' }, 500);
+  }
+});
+
+// GET /api/v1/entries/:id - Get single entry by ID (any valid key, namespace permission enforced)
+app.get('/api/v1/entries/:id', authMiddleware, async (c) => {
+  try {
+    const workspace = c.get('workspace') as Workspace;
+    const entryId = c.req.param('id');
+
+    // Fetch the entry
+    const client = await pool.connect();
+    let entryRow: any | null = null;
+    try {
+      const result = await client.query(
+        'SELECT * FROM entries WHERE id = $1 AND workspace_id = $2',
+        [entryId, workspace.id]
+      );
+      entryRow = result.rows[0] || null;
+    } finally {
+      client.release();
+    }
+
+    if (!entryRow) {
+      return c.json({ error: 'Entry not found', code: 'NOT_FOUND' }, 404);
+    }
+
+    // Check expiry
+    if (isExpired(entryRow.created_at, entryRow.ttl)) {
+      return c.json({ error: 'Entry not found', code: 'NOT_FOUND' }, 404);
+    }
+
+    // Namespace-level read permission enforcement for agent keys
+    const agent = (c as any).agent;
+    if (agent && agent.agentId) {
+      const permittedNamespaces = await getAgentPermittedNamespaces(workspace.id, agent.agentId);
+      if (permittedNamespaces === null) {
+        // Legacy agent with no permissions rows — allow full read, log warning
+        console.warn(`[synapse] Agent '${agent.agentId}' has no permissions rows in workspace '${workspace.id}' — granting legacy full read access`);
+      } else if (!permittedNamespaces.has('*') && !permittedNamespaces.has(entryRow.namespace)) {
+        return c.json({
+          error: `Agent '${agent.agentId}' does not have read permission for namespace '${entryRow.namespace}'`,
+          code: 'INSUFFICIENT_PERMISSIONS'
+        }, 403);
+      }
+    }
+    // Workspace-level keys (no agent) have admin access — return entry unfiltered
+
+    const entry = {
+      ...entryRow,
+      tags: typeof entryRow.tags === 'string' ? JSON.parse(entryRow.tags) : entryRow.tags
+    };
+
+    return c.json({ entry });
+  } catch (error) {
+    console.error('Error getting entry:', error);
     return c.json({ error: 'Internal server error', code: 'INTERNAL_ERROR' }, 500);
   }
 });
