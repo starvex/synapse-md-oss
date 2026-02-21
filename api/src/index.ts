@@ -11,6 +11,8 @@ interface Workspace {
   write_key: string;
   read_key: string;
   created_at: string;
+  bridge_policy: string; // 'none' | 'admin-only' | 'open'
+  frozen: boolean;
 }
 
 interface Agent {
@@ -138,6 +140,15 @@ async function initDatabase() {
       ALTER TABLE agents_v2 ADD COLUMN IF NOT EXISTS model TEXT;
     `;
 
+    // Migration: add bridge_policy and frozen columns to workspaces
+    const addBridgePolicyColumn = `
+      ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS bridge_policy TEXT DEFAULT 'none';
+    `;
+
+    const addFrozenColumn = `
+      ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS frozen BOOLEAN DEFAULT FALSE;
+    `;
+
     const createAuditLog = `
       CREATE TABLE IF NOT EXISTS audit_log (
         id SERIAL PRIMARY KEY,
@@ -241,6 +252,8 @@ async function initDatabase() {
     await client.query(createAgents);
     await client.query(createAgentsV2);
     await client.query(addModelColumn).catch(() => {}); // Ignore if column exists
+    await client.query(addBridgePolicyColumn).catch(() => {}); // Ignore if column exists
+    await client.query(addFrozenColumn).catch(() => {}); // Ignore if column exists
     await client.query(createAuditLog);
     await client.query(createAgentKeys);
     await client.query(createAgentKeysIndices);
@@ -1691,6 +1704,11 @@ app.post('/api/v1/entries', authMiddleware, async (c) => {
     }
     
     const workspace = c.get('workspace') as Workspace;
+
+    // Check if workspace is frozen (human veto mechanism)
+    if (workspace.frozen) {
+      return c.json({ error: 'Workspace is frozen by administrator', code: 'WORKSPACE_FROZEN' }, 403);
+    }
     const body = await c.req.json();
     
     let { from, from_agent, namespace = 'general', content, tags = [], priority = 'info', ttl } = body;
@@ -3106,6 +3124,285 @@ app.post('/api/v1/workspaces/:id/webhooks/:webhookId/test', authMiddleware, asyn
     }
   } catch (error) {
     console.error('Error testing webhook:', error);
+    return c.json({ error: 'Internal server error', code: 'INTERNAL_ERROR' }, 500);
+  }
+});
+
+// ─── FEDERATION BRIDGE ENDPOINT ───────────────────────────────────────────────
+
+// POST /api/v1/bridge - Cross-workspace message bridging (write key only)
+// Requires: write key belonging to from_workspace. Target workspace must allow bridging via bridge_policy.
+// Namespace must start with 'shared' or 'bridge-'.
+app.post('/api/v1/bridge', authMiddleware, async (c) => {
+  try {
+    const isWriteKey = c.get('isWriteKey') as boolean;
+    if (!isWriteKey) {
+      return c.json({ error: 'Write access required', code: 'INSUFFICIENT_PERMISSIONS' }, 403);
+    }
+
+    const fromWorkspace = c.get('workspace') as Workspace;
+
+    // Check if from_workspace is frozen
+    if (fromWorkspace.frozen) {
+      return c.json({ error: 'Workspace is frozen by administrator', code: 'WORKSPACE_FROZEN' }, 403);
+    }
+
+    const body = await c.req.json();
+    const { from_workspace, to_workspace, namespace, content, from_agent } = body;
+
+    // Validate required fields
+    if (!from_workspace || !to_workspace || !namespace || !content || !from_agent) {
+      return c.json({
+        error: 'from_workspace, to_workspace, namespace, content, and from_agent are required',
+        code: 'VALIDATION_ERROR'
+      }, 400);
+    }
+
+    // Verify from_workspace matches the authenticated workspace
+    if (fromWorkspace.id !== from_workspace) {
+      return c.json({
+        error: 'from_workspace must match the authenticated workspace',
+        code: 'WORKSPACE_MISMATCH'
+      }, 400);
+    }
+
+    // Only allow bridging to namespaces starting with 'shared' or 'bridge-'
+    if (!namespace.startsWith('shared') && !namespace.startsWith('bridge-')) {
+      return c.json({
+        error: "Bridge namespace must start with 'shared' or 'bridge-'",
+        code: 'NAMESPACE_NOT_BRIDGEABLE'
+      }, 400);
+    }
+
+    // Fetch target workspace
+    const toWorkspace = await getWorkspaceById(to_workspace);
+    if (!toWorkspace) {
+      return c.json({ error: 'Target workspace not found', code: 'NOT_FOUND' }, 404);
+    }
+
+    // Check if target workspace is frozen
+    if (toWorkspace.frozen) {
+      return c.json({ error: 'Target workspace is frozen by administrator', code: 'WORKSPACE_FROZEN' }, 403);
+    }
+
+    // Enforce bridge_policy on the target workspace
+    const policy = toWorkspace.bridge_policy || 'none';
+    if (policy === 'none') {
+      return c.json({
+        error: 'Target workspace does not allow bridging (bridge_policy=none)',
+        code: 'BRIDGE_NOT_ALLOWED'
+      }, 403);
+    }
+
+    if (policy === 'admin-only') {
+      // Only workspace write keys (syn_w_) are allowed for admin-only policy
+      const apiKey = c.get('apiKey') as string;
+      if (!apiKey.startsWith('syn_w_')) {
+        return c.json({
+          error: 'Target workspace requires admin key (bridge_policy=admin-only)',
+          code: 'BRIDGE_NOT_ALLOWED'
+        }, 403);
+      }
+    }
+    // policy === 'open': any write key is allowed (already checked above)
+
+    // Build entry content with bridged_from metadata
+    const bridgedFrom = {
+      workspace: from_workspace,
+      agent: from_agent,
+      timestamp: new Date().toISOString()
+    };
+    const bridgedContent = content;
+
+    const entryId = generateEntryId();
+    const createdAt = new Date().toISOString();
+
+    // Write to target workspace with bridged_from stored as a tag
+    const bridgeTag = `bridged_from:${from_workspace}:${from_agent}`;
+
+    const client = await pool.connect();
+    try {
+      await client.query(
+        `INSERT INTO entries (id, workspace_id, from_agent, namespace, content, tags, priority, ttl)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          entryId,
+          to_workspace,
+          from_agent,
+          namespace,
+          bridgedContent,
+          JSON.stringify([bridgeTag, 'bridged']),
+          'info',
+          null
+        ]
+      );
+
+      // Log the bridge event in the source workspace audit log
+      const ip = c.req.header('x-forwarded-for') ?? 'unknown';
+      await client.query(
+        'INSERT INTO audit_log (workspace_id, action, agent, key_type, details, ip) VALUES ($1, $2, $3, $4, $5, $6)',
+        [
+          from_workspace,
+          'POST /api/v1/bridge',
+          from_agent,
+          'write',
+          `Bridge event: ${from_workspace} → ${to_workspace} [${namespace}] entry=${entryId}`,
+          ip
+        ]
+      );
+      // Also log in target workspace
+      await client.query(
+        'INSERT INTO audit_log (workspace_id, action, agent, key_type, details, ip) VALUES ($1, $2, $3, $4, $5, $6)',
+        [
+          to_workspace,
+          'bridge.received',
+          from_agent,
+          'bridge',
+          `Bridged entry received from workspace=${from_workspace} agent=${from_agent} entry=${entryId}`,
+          ip
+        ]
+      );
+    } finally {
+      client.release();
+    }
+
+    // Fire webhooks for the target workspace (non-blocking)
+    fireWebhooks(to_workspace, namespace, {
+      id: entryId,
+      from_agent,
+      namespace,
+      content: bridgedContent,
+      priority: 'info',
+      tags: [bridgeTag, 'bridged'],
+      created_at: createdAt,
+    });
+
+    return c.json({
+      id: entryId,
+      createdAt,
+      bridgedFrom,
+      message: `Entry bridged from ${from_workspace} to ${to_workspace} in namespace '${namespace}'`
+    }, 201);
+  } catch (error) {
+    console.error('Error in bridge endpoint:', error);
+    return c.json({ error: 'Internal server error', code: 'INTERNAL_ERROR' }, 500);
+  }
+});
+
+// ─── WORKSPACE FREEZE/UNFREEZE ENDPOINT ──────────────────────────────────────
+
+// POST /api/v1/workspaces/:id/freeze - Freeze or unfreeze a workspace (owner write key only)
+// Body: { "frozen": true } or { "frozen": false }
+// While frozen, no new entries can be written (403). Human veto mechanism.
+app.post('/api/v1/workspaces/:id/freeze', authMiddleware, async (c) => {
+  try {
+    const workspace = c.get('workspace') as Workspace;
+    const workspaceId = c.req.param('id');
+    const apiKey = c.get('apiKey') as string;
+
+    if (workspace.id !== workspaceId) {
+      return c.json({ error: 'Workspace mismatch', code: 'WORKSPACE_MISMATCH' }, 400);
+    }
+
+    // Only the workspace owner (write key) can freeze/unfreeze
+    if (!apiKey.startsWith('syn_w_')) {
+      return c.json({ error: 'Only workspace owner (write key) can freeze/unfreeze workspace', code: 'OWNER_REQUIRED' }, 403);
+    }
+
+    const body = await c.req.json();
+    if (typeof body.frozen !== 'boolean') {
+      return c.json({ error: '"frozen" (boolean) is required in request body', code: 'VALIDATION_ERROR' }, 400);
+    }
+
+    const { frozen } = body;
+
+    const client = await pool.connect();
+    try {
+      await client.query(
+        'UPDATE workspaces SET frozen = $1 WHERE id = $2',
+        [frozen, workspaceId]
+      );
+
+      // Log the freeze event
+      const ip = c.req.header('x-forwarded-for') ?? 'unknown';
+      await client.query(
+        'INSERT INTO audit_log (workspace_id, action, agent, key_type, details, ip) VALUES ($1, $2, $3, $4, $5, $6)',
+        [
+          workspaceId,
+          frozen ? 'workspace.freeze' : 'workspace.unfreeze',
+          null,
+          'write',
+          `Workspace ${frozen ? 'frozen' : 'unfrozen'} by owner`,
+          ip
+        ]
+      );
+    } finally {
+      client.release();
+    }
+
+    return c.json({
+      workspaceId,
+      frozen,
+      message: frozen
+        ? 'Workspace frozen. No new entries can be written until unfrozen.'
+        : 'Workspace unfrozen. Entries can be written again.'
+    });
+  } catch (error) {
+    console.error('Error in freeze endpoint:', error);
+    return c.json({ error: 'Internal server error', code: 'INTERNAL_ERROR' }, 500);
+  }
+});
+
+// POST /api/v1/workspaces/:id/bridge-policy - Set bridge_policy (owner write key only)
+// Body: { "policy": "none" | "admin-only" | "open" }
+app.post('/api/v1/workspaces/:id/bridge-policy', authMiddleware, async (c) => {
+  try {
+    const workspace = c.get('workspace') as Workspace;
+    const workspaceId = c.req.param('id');
+    const apiKey = c.get('apiKey') as string;
+
+    if (workspace.id !== workspaceId) {
+      return c.json({ error: 'Workspace mismatch', code: 'WORKSPACE_MISMATCH' }, 400);
+    }
+
+    // Only the workspace owner (write key) can change bridge policy
+    if (!apiKey.startsWith('syn_w_')) {
+      return c.json({ error: 'Only workspace owner (write key) can change bridge policy', code: 'OWNER_REQUIRED' }, 403);
+    }
+
+    const body = await c.req.json();
+    const { policy } = body;
+
+    if (!['none', 'admin-only', 'open'].includes(policy)) {
+      return c.json({
+        error: 'policy must be one of: none, admin-only, open',
+        code: 'VALIDATION_ERROR'
+      }, 400);
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query(
+        'UPDATE workspaces SET bridge_policy = $1 WHERE id = $2',
+        [policy, workspaceId]
+      );
+
+      const ip = c.req.header('x-forwarded-for') ?? 'unknown';
+      await client.query(
+        'INSERT INTO audit_log (workspace_id, action, agent, key_type, details, ip) VALUES ($1, $2, $3, $4, $5, $6)',
+        [workspaceId, 'workspace.bridge-policy', null, 'write', `Bridge policy set to: ${policy}`, ip]
+      );
+    } finally {
+      client.release();
+    }
+
+    return c.json({
+      workspaceId,
+      bridgePolicy: policy,
+      message: `Bridge policy set to '${policy}'`
+    });
+  } catch (error) {
+    console.error('Error setting bridge policy:', error);
     return c.json({ error: 'Internal server error', code: 'INTERNAL_ERROR' }, 500);
   }
 });
