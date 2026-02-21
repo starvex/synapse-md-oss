@@ -214,6 +214,28 @@ async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_invitations_status ON invitations(status);
     `;
 
+    const createWebhooks = `
+      CREATE TABLE IF NOT EXISTS webhooks (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        url TEXT NOT NULL,
+        namespaces TEXT[] DEFAULT '{}',
+        events TEXT[] DEFAULT '{entry.created}',
+        secret TEXT,
+        status TEXT DEFAULT 'active',
+        failure_count INTEGER DEFAULT 0,
+        last_delivery TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        FOREIGN KEY (workspace_id) REFERENCES workspaces(id)
+      )
+    `;
+
+    const createWebhooksIndex = `
+      CREATE INDEX IF NOT EXISTS idx_webhooks_workspace ON webhooks(workspace_id);
+      CREATE INDEX IF NOT EXISTS idx_webhooks_status ON webhooks(workspace_id, status);
+    `;
+
     await client.query(createWorkspaces);
     await client.query(createEntries);
     await client.query(createAgents);
@@ -226,6 +248,8 @@ async function initDatabase() {
     await client.query(createPermissionsIndices);
     await client.query(createInvitations);
     await client.query(createInvitationsIndices);
+    await client.query(createWebhooks);
+    await client.query(createWebhooksIndex);
     
     console.log('Database tables initialized successfully');
   } catch (error) {
@@ -264,6 +288,10 @@ function generateKeyId(): string {
 
 function generateInvitationId(): string {
   return 'inv_' + crypto.randomBytes(12).toString('hex');
+}
+
+function generateWebhookId(): string {
+  return 'whk_' + crypto.randomBytes(12).toString('hex');
 }
 
 function hashApiKey(key: string): string {
@@ -1036,6 +1064,182 @@ async function migrateAgentPermissions(workspaceId: string): Promise<void> {
   }
 }
 
+// ─── Webhook DB helpers ───────────────────────────────────────────────────────
+
+async function createWebhook(
+  workspaceId: string,
+  agentId: string,
+  url: string,
+  namespaces: string[],
+  events: string[],
+  secret: string | null
+): Promise<any> {
+  const client = await pool.connect();
+  try {
+    const id = generateWebhookId();
+    const result = await client.query(
+      `INSERT INTO webhooks (id, workspace_id, agent_id, url, namespaces, events, secret)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING *`,
+      [id, workspaceId, agentId, url, namespaces, events, secret]
+    );
+    return result.rows[0];
+  } finally {
+    client.release();
+  }
+}
+
+async function getWebhooksByWorkspace(workspaceId: string): Promise<any[]> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      'SELECT * FROM webhooks WHERE workspace_id = $1 ORDER BY created_at DESC',
+      [workspaceId]
+    );
+    return result.rows;
+  } finally {
+    client.release();
+  }
+}
+
+async function getWebhookById(workspaceId: string, webhookId: string): Promise<any | null> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      'SELECT * FROM webhooks WHERE id = $1 AND workspace_id = $2',
+      [webhookId, workspaceId]
+    );
+    return result.rows[0] || null;
+  } finally {
+    client.release();
+  }
+}
+
+async function deleteWebhook(workspaceId: string, webhookId: string): Promise<boolean> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      'DELETE FROM webhooks WHERE id = $1 AND workspace_id = $2',
+      [webhookId, workspaceId]
+    );
+    return (result.rowCount ?? 0) > 0;
+  } finally {
+    client.release();
+  }
+}
+
+async function getActiveWebhooksForEntry(workspaceId: string, namespace: string): Promise<any[]> {
+  const client = await pool.connect();
+  try {
+    // Match webhooks that listen to the specific namespace OR to "*"
+    const result = await client.query(
+      `SELECT * FROM webhooks
+       WHERE workspace_id = $1
+         AND status = 'active'
+         AND (namespaces = '{}' OR '*' = ANY(namespaces) OR $2 = ANY(namespaces))`,
+      [workspaceId, namespace]
+    );
+    return result.rows;
+  } finally {
+    client.release();
+  }
+}
+
+async function recordWebhookSuccess(webhookId: string): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query(
+      `UPDATE webhooks SET failure_count = 0, last_delivery = NOW() WHERE id = $1`,
+      [webhookId]
+    );
+  } finally {
+    client.release();
+  }
+}
+
+async function recordWebhookFailure(webhookId: string): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query(
+      `UPDATE webhooks
+       SET failure_count = failure_count + 1,
+           status = CASE WHEN failure_count + 1 >= 10 THEN 'failed' ELSE status END
+       WHERE id = $1`,
+      [webhookId]
+    );
+  } finally {
+    client.release();
+  }
+}
+
+// ─── Webhook delivery ─────────────────────────────────────────────────────────
+
+function buildWebhookSignature(body: string, secret: string): string {
+  return crypto.createHmac('sha256', secret).update(body).digest('hex');
+}
+
+async function deliverWebhook(webhook: any, payload: object): Promise<void> {
+  const bodyStr = JSON.stringify(payload);
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'User-Agent': 'Synapse-Webhooks/1.0',
+  };
+
+  if (webhook.secret) {
+    headers['X-Synapse-Signature'] = buildWebhookSignature(bodyStr, webhook.secret);
+  }
+
+  try {
+    const response = await fetch(webhook.url, {
+      method: 'POST',
+      headers,
+      body: bodyStr,
+      signal: AbortSignal.timeout(10_000), // 10 s hard timeout
+    });
+
+    if (response.ok) {
+      await recordWebhookSuccess(webhook.id);
+    } else {
+      console.warn(`Webhook ${webhook.id} returned ${response.status}`);
+      await recordWebhookFailure(webhook.id);
+    }
+  } catch (err) {
+    console.error(`Webhook ${webhook.id} delivery error:`, err);
+    await recordWebhookFailure(webhook.id);
+  }
+}
+
+function fireWebhooks(workspaceId: string, namespace: string, entry: any): void {
+  // Fire-and-forget — does NOT block the HTTP response
+  Promise.resolve().then(async () => {
+    try {
+      const webhooks = await getActiveWebhooksForEntry(workspaceId, namespace);
+      if (webhooks.length === 0) return;
+
+      const isUrgent = entry.priority === 'critical' || entry.priority === 'error';
+      const payload: any = {
+        event: 'entry.created',
+        workspace_id: workspaceId,
+        entry: {
+          id: entry.id,
+          from_agent: entry.from_agent,
+          namespace: entry.namespace,
+          content: entry.content,
+          priority: entry.priority,
+          tags: entry.tags,
+          created_at: entry.created_at,
+        },
+        timestamp: new Date().toISOString(),
+      };
+      if (isUrgent) payload.urgent = true;
+
+      await Promise.allSettled(webhooks.map(wh => deliverWebhook(wh, payload)));
+    } catch (err) {
+      console.error('fireWebhooks error:', err);
+    }
+  });
+}
+
 // Initialize database when server starts
 initDatabase()
   .then(async () => {
@@ -1277,7 +1481,7 @@ app.post('/api/v1/workspaces', async (c) => {
 app.get('/api/v1/auth/me', authMiddleware, async (c) => {
   try {
     const workspace = c.get('workspace') as Workspace;
-    const agent = c.get('agent') as Agent | undefined;
+    const agent = (c as any).agent as Agent | undefined;
     const isWriteKey = c.get('isWriteKey') as boolean;
     const isReadKey = c.get('isReadKey') as boolean;
     
@@ -1409,6 +1613,8 @@ app.post('/api/v1/entries', authMiddleware, async (c) => {
     
     const id = generateEntryId();
     
+    const createdAt = new Date().toISOString();
+
     await createEntry(
       id,
       workspace.id,
@@ -1419,10 +1625,21 @@ app.post('/api/v1/entries', authMiddleware, async (c) => {
       priority,
       ttl || null
     );
-    
+
+    // Fire webhooks non-blocking (after entry is persisted)
+    fireWebhooks(workspace.id, namespace, {
+      id,
+      from_agent: from,
+      namespace,
+      content,
+      priority,
+      tags,
+      created_at: createdAt,
+    });
+
     return c.json({
       id,
-      createdAt: new Date().toISOString(),
+      createdAt,
       message: 'Entry created successfully'
     }, 201);
   } catch (error) {
@@ -1464,7 +1681,7 @@ app.delete('/api/v1/entries/:id', authMiddleware, async (c) => {
   try {
     const workspace = c.get('workspace') as Workspace;
     const isWriteKey = c.get('isWriteKey') as boolean;
-    const agent = c.get('agent') as Agent | undefined;
+    const agent = (c as any).agent as Agent | undefined;
     const entryId = c.req.param('id');
     
     if (!isWriteKey) {
@@ -2601,6 +2818,182 @@ app.post('/api/v1/invites/:inviteId/accept', async (c) => {
     }
   } catch (error) {
     console.error('Error accepting invitation:', error);
+    return c.json({ error: 'Internal server error', code: 'INTERNAL_ERROR' }, 500);
+  }
+});
+
+// ─── WEBHOOK ENDPOINTS ────────────────────────────────────────────────────────
+
+// Helper: require owner/admin access and workspace match
+function requireOwnerAdmin(c: Context<AppEnvironment>): { ok: true } | Response {
+  const workspace = c.get('workspace') as Workspace;
+  const workspaceId = (c.req as any).param('id');
+  if (workspace.id !== workspaceId) {
+    return (c as any).json({ error: 'Workspace mismatch', code: 'WORKSPACE_MISMATCH' }, 400);
+  }
+  const agent = (c as any).agent;
+  const isWorkspaceKey = !agent;
+  const isOwnerAdmin = agent && ['owner', 'admin'].includes(agent.role);
+  if (!isWorkspaceKey && !isOwnerAdmin) {
+    return (c as any).json({ error: 'Only workspace owner or admin can manage webhooks', code: 'INSUFFICIENT_PERMISSIONS' }, 403);
+  }
+  return { ok: true };
+}
+
+// POST /api/v1/workspaces/:id/webhooks — register webhook
+app.post('/api/v1/workspaces/:id/webhooks', authMiddleware, async (c) => {
+  try {
+    const check = requireOwnerAdmin(c);
+    if ('status' in check) return check;
+
+    const workspace = c.get('workspace') as Workspace;
+    const agent = (c as any).agent;
+    const agentId: string = agent?.agentId || 'workspace-owner';
+
+    const body = await c.req.json();
+    const { url, namespaces = [], events = ['entry.created'], secret } = body;
+
+    if (!url || typeof url !== 'string') {
+      return c.json({ error: 'url is required', code: 'VALIDATION_ERROR' }, 400);
+    }
+
+    try {
+      new URL(url);
+    } catch {
+      return c.json({ error: 'url must be a valid URL', code: 'VALIDATION_ERROR' }, 400);
+    }
+
+    if (!Array.isArray(namespaces)) {
+      return c.json({ error: 'namespaces must be an array', code: 'VALIDATION_ERROR' }, 400);
+    }
+
+    if (!Array.isArray(events) || events.length === 0) {
+      return c.json({ error: 'events must be a non-empty array', code: 'VALIDATION_ERROR' }, 400);
+    }
+
+    const webhook = await createWebhook(workspace.id, agentId, url, namespaces, events, secret || null);
+
+    return c.json({
+      webhookId: webhook.id,
+      url: webhook.url,
+      namespaces: webhook.namespaces,
+      events: webhook.events,
+      status: webhook.status,
+      createdAt: webhook.created_at,
+    }, 201);
+  } catch (error) {
+    console.error('Error creating webhook:', error);
+    return c.json({ error: 'Internal server error', code: 'INTERNAL_ERROR' }, 500);
+  }
+});
+
+// GET /api/v1/workspaces/:id/webhooks — list webhooks
+app.get('/api/v1/workspaces/:id/webhooks', authMiddleware, async (c) => {
+  try {
+    const check = requireOwnerAdmin(c);
+    if ('status' in check) return check;
+
+    const workspace = c.get('workspace') as Workspace;
+    const webhooks = await getWebhooksByWorkspace(workspace.id);
+
+    return c.json({
+      webhooks: webhooks.map(wh => ({
+        webhookId: wh.id,
+        agentId: wh.agent_id,
+        url: wh.url,
+        namespaces: wh.namespaces,
+        events: wh.events,
+        status: wh.status,
+        failureCount: wh.failure_count,
+        lastDelivery: wh.last_delivery,
+        createdAt: wh.created_at,
+      })),
+    });
+  } catch (error) {
+    console.error('Error listing webhooks:', error);
+    return c.json({ error: 'Internal server error', code: 'INTERNAL_ERROR' }, 500);
+  }
+});
+
+// DELETE /api/v1/workspaces/:id/webhooks/:webhookId — delete webhook
+app.delete('/api/v1/workspaces/:id/webhooks/:webhookId', authMiddleware, async (c) => {
+  try {
+    const check = requireOwnerAdmin(c);
+    if ('status' in check) return check;
+
+    const workspace = c.get('workspace') as Workspace;
+    const webhookId = c.req.param('webhookId');
+
+    const deleted = await deleteWebhook(workspace.id, webhookId);
+    if (!deleted) {
+      return c.json({ error: 'Webhook not found', code: 'NOT_FOUND' }, 404);
+    }
+
+    return c.json({ success: true, message: 'Webhook deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting webhook:', error);
+    return c.json({ error: 'Internal server error', code: 'INTERNAL_ERROR' }, 500);
+  }
+});
+
+// POST /api/v1/workspaces/:id/webhooks/:webhookId/test — send test event
+app.post('/api/v1/workspaces/:id/webhooks/:webhookId/test', authMiddleware, async (c) => {
+  try {
+    const check = requireOwnerAdmin(c);
+    if ('status' in check) return check;
+
+    const workspace = c.get('workspace') as Workspace;
+    const webhookId = c.req.param('webhookId');
+
+    const webhook = await getWebhookById(workspace.id, webhookId);
+    if (!webhook) {
+      return c.json({ error: 'Webhook not found', code: 'NOT_FOUND' }, 404);
+    }
+
+    const testPayload = {
+      event: 'entry.created',
+      workspace_id: workspace.id,
+      entry: {
+        id: generateEntryId(),
+        from_agent: 'synapse-test',
+        namespace: 'test',
+        content: 'This is a test webhook delivery from Synapse.',
+        priority: 'info',
+        tags: ['test'],
+        created_at: new Date().toISOString(),
+      },
+      timestamp: new Date().toISOString(),
+      test: true,
+    };
+
+    // Deliver synchronously so we can report success/failure immediately
+    const bodyStr = JSON.stringify(testPayload);
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'User-Agent': 'Synapse-Webhooks/1.0',
+    };
+    if (webhook.secret) {
+      headers['X-Synapse-Signature'] = buildWebhookSignature(bodyStr, webhook.secret);
+    }
+
+    try {
+      const response = await fetch(webhook.url, {
+        method: 'POST',
+        headers,
+        body: bodyStr,
+        signal: AbortSignal.timeout(10_000),
+      });
+
+      return c.json({
+        success: response.ok,
+        statusCode: response.status,
+        message: response.ok ? 'Test event delivered successfully' : `Endpoint returned ${response.status}`,
+      });
+    } catch (fetchErr: any) {
+      return c.json({ success: false, message: `Delivery failed: ${fetchErr.message}` }, 502);
+    }
+  } catch (error) {
+    console.error('Error testing webhook:', error);
     return c.json({ error: 'Internal server error', code: 'INTERNAL_ERROR' }, 500);
   }
 });
